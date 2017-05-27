@@ -130,10 +130,19 @@ class CozmoRos(object):
         self._optical_frame_orientation = quaternion_from_euler(-np.pi/2., .0, -np.pi/2.)
         self._camera_info_manager = CameraInfoManager('cozmo_camera', namespace='/cozmo_camera')
 
+        self._battery_high_upper_bound = 3.85
+        self._battery_high_lower_bound = 3.80
+        self._battery_high = self._cozmo.battery_voltage > self._battery_high_upper_bound
+
+        self._battery_low_upper_bound = 3.65
+        self._battery_low_lower_bound = 3.60
+        self._battery_low = self._cozmo.battery_voltage > self._battery_low_upper_bound
+
         # tf
         self._tfb = TransformBroadcaster()
 
         # params
+        self._led_mode = rospy.get_param('~led_mode', 0)
         self._odom_frame = rospy.get_param('~odom_frame', 'odom')
         self._footprint_frame = rospy.get_param('~footprint_frame', 'base_footprint')
         self._base_frame = rospy.get_param('~base_frame', 'base_link')
@@ -174,6 +183,52 @@ class CozmoRos(object):
         # camera info manager
         self._camera_info_manager.setURL(camera_info_url)
         self._camera_info_manager.loadCameraInfo()
+
+    def _update_backpack_led_from_battery(self):
+        # check LED mode
+        if self._led_mode != 1:
+            return
+
+        # get battery voltage
+        battery_voltage = self._cozmo.battery_voltage
+
+        # update battery states
+        if self._battery_high and battery_voltage < self._battery_high_lower_bound:
+            self._battery_high = False
+        if not self._battery_high and battery_voltage > self._battery_high_upper_bound:
+            self._battery_high = True
+        if self._battery_low and battery_voltage < self._battery_low_lower_bound:
+            self._battery_low = False
+        if not self._battery_low and battery_voltage > self._battery_low_upper_bound:
+            self._battery_low = True
+
+        # setups lights
+        color_red = cozmo.lights.Color(name="red", int_color=0xff0000ff)
+        color_green = cozmo.lights.Color(name="green", int_color=0x00ff00ff)
+
+        led_off = cozmo.lights.Light(cozmo.lights.off, on_period_ms=1000)
+        # avoid flickering: on_color==off_color, see ticket #COZMO-3319
+        led_green = cozmo.lights.Light(on_color=color_green, off_color=color_green)
+        led_red = cozmo.lights.Light(on_color=color_red, off_color=color_red)
+
+        # initialize LEDs OFF
+        lights = [led_off for _ in range(5)]
+
+        # setup colors
+        if self._battery_high:
+            lights[3] = led_green
+            lights[2] = led_green
+            lights[1] = led_green
+        elif self._battery_low:
+            lights[3] = led_green
+            lights[2] = led_green
+        else:
+            lights[3] = led_green
+            lights[0] = led_red
+            lights[4] = led_red
+
+        # set lights using SDK
+        self._cozmo.set_backpack_lights(*lights)
 
     def _publish_diagnostics(self):
         # alias
@@ -231,12 +286,16 @@ class CozmoRos(object):
         :param  msg:    The color to be set.
 
         """
+        # check LED mode
+        if self._led_mode != 0:
+            return
         # setup color as integer values
-        color = [int(x * 255) for x in [msg.r, msg.g, msg.b, msg.a]]
+        rgb = [int(x * 255) for x in [msg.r, msg.g, msg.b]]
+        color = cozmo.lights.Color(rgb=rgb)
         # create lights object with duration
-        light = cozmo.lights.Light(cozmo.lights.Color(rgba=color), on_period_ms=1000)
+        lights = cozmo.lights.Light(on_color=color, off_color=color, on_period_ms=1000)
         # set lights
-        self._cozmo.set_all_backpack_lights(light)
+        self._cozmo.set_all_backpack_lights(lights)
 
     def _twist_callback(self, cmd):
         """
@@ -476,6 +535,7 @@ class CozmoRos(object):
             self._publish_battery()
             self._publish_odometry()
             self._publish_diagnostics()
+            self._update_backpack_led_from_battery()
             # send message repeatedly to avoid idle mode.
             # This might cause low battery soon
             # TODO improve this!
